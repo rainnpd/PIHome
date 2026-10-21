@@ -1,0 +1,12 @@
+#!/bin/sh
+# 按 ~/.config/android-home/idle-timeout 启动 swayidle（0 = 永不熄屏）。
+# 由 lwrespawn 守护：设置里改时长后只需 pkill swayidle，就会按新值重启。
+f="$HOME/.config/android-home/idle-timeout"
+t=$(tr -cd '0-9' < "$f" 2>/dev/null)
+[ -n "$t" ] || t=300
+if [ "$t" -eq 0 ]; then
+    exec sleep infinity
+fi
+exec /usr/bin/swayidle -w timeout "$t" \
+    'sudo -n /usr/local/bin/ah-screen-off' \
+    resume 'sudo -n /usr/local/bin/ah-screen-on'

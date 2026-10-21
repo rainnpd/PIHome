@@ -1,0 +1,1422 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+android-home — 安卓风格触摸主屏
+运行在 labwc 的 layer-shell "background" 层：始终位于所有窗口之下，
+配合 labwc 的 ToggleShowDesktop(3 指上滑) 实现"回到主屏"。
+
+- 按分类分页显示应用(多媒体/办公/开发/游戏/工具/系统)
+- 全屏任意位置左右滑动翻页，轻点图标启动应用
+- 底部 dock 固定常用应用 + 虚拟键盘开关
+
+手势实现要点：图标不是 Gtk.Button(按钮会抢走触摸序列，导致只有空白处能滑)，
+而是普通控件 + 在 root 上统一做命中测试，所以整屏都能滑动。
+"""
+import ctypes
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, Gdk, Gio, GdkPixbuf, GLib, Pango  # noqa: E402
+
+# ---------------- 可调参数 ----------------
+WALLPAPER_FALLBACK = "/usr/share/rpd-wallpaper/sunrise.jpg"
+PCMANFM_DESKTOP_CONF = os.path.expanduser(
+    "~/.config/pcmanfm/default/desktop-items-HDMI-A-1.conf")
+
+DOCK_IDS = ["chromium", "pcmanfm", "lxterminal", "galculator", "trae-cn"]
+
+DRAG_START_PX = 10     # 手指横向移动超过该值就开始“跟手”拖动
+SNAP_RATIO = 0.12      # 松手时拖动超过页宽的该比例就翻页
+SLIDE_MS = 150         # 松手后的收尾动画时长(ms)
+MIN_FRAME_S = 0.022    # 拖动时的最高刷新间隔(~45fps)，给重绘留余量
+ICON_MAX = 116
+DOCK_ICON = 60
+LAUNCH_GAP = 2.0       # 同一应用的点击防抖(秒)，避免连点拉起多个实例
+
+RECENT_FILE = os.path.expanduser("~/.config/android-home/recent.json")
+RECENT_FALLBACK = 24   # 页面容量未知时的上限
+
+CUSTOM_WALLPAPER = os.path.expanduser("~/.config/android-home/wallpaper")
+FONT_FILE = os.path.expanduser("~/.config/android-home/font-size")
+IDLE_FILE = os.path.expanduser("~/.config/android-home/idle-timeout")
+WP_POLL_MS = 2000      # 壁纸/字体配置文件变化轮询间隔
+
+WALLPAPER_DIR = "/usr/share/rpd-wallpaper"
+THUMB_DIR = os.path.expanduser("~/.cache/android-home/thumbs")
+THUMB_W, THUMB_H = 168, 104
+
+FONT_DEFAULT = 13
+FONT_CHOICES = [("小", 11), ("中", 13), ("大", 15), ("特大", 17)]
+IDLE_CHOICES = [("1 分钟", 60), ("2 分钟", 120), ("5 分钟", 300),
+                ("10 分钟", 600), ("永不", 0)]
+IDLE_DEFAULT = 300
+
+LOG = "/tmp/android-home.log"
+
+# 分类规则：命中的第一个类别生效。Qt/GTK/KDE/Application 这类仓库标记不参与判断。
+# 网络类应用并入「多媒体」页；无法归类的应用并入「系统」页。
+CATEGORY_RULES = [
+    ("多媒体", {"Network", "WebBrowser", "Email", "RemoteAccess", "InstantMessaging",
+                "AudioVideo", "Audio", "Video", "Player", "Recorder",
+                "Graphics", "2DGraphics", "RasterGraphics", "VectorGraphics", "Photography"}),
+    ("办公", {"Office", "WordProcessor", "Spreadsheet", "Presentation", "Database",
+              "Math", "Document"}),
+    ("开发", {"Development", "IDE", "Electronics", "Science"}),
+    ("游戏", {"Game"}),
+    ("工具", {"Utility", "TextEditor", "Archiving", "FileManager", "Calculator"}),
+    ("系统", {"System", "Settings", "DesktopSettings", "HardwareSettings", "PackageManager",
+              "Monitor", "Filesystem", "TerminalEmulator", "Security", "Core"}),
+]
+CATEGORY_ORDER = ["多媒体", "办公", "开发", "游戏", "工具", "系统"]
+
+
+def log(*a):
+    try:
+        with open(LOG, "a") as f:
+            f.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), " ".join(str(x) for x in a)))
+    except Exception:
+        pass
+
+
+# ---------------- layer-shell (ctypes) ----------------
+class LayerShell:
+    BACKGROUND, BOTTOM, TOP, OVERLAY = 0, 1, 2, 3
+    LEFT, RIGHT, EDGE_TOP, EDGE_BOTTOM = 0, 1, 2, 3
+    KB_NONE, KB_EXCLUSIVE, KB_ON_DEMAND = 0, 1, 2
+
+    def __init__(self):
+        self.lib = ctypes.CDLL("libgtk-layer-shell.so.0", use_errno=True)
+        self.lib.gtk_layer_init_for_window.argtypes = [ctypes.c_void_p]
+        self.lib.gtk_layer_set_layer.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.gtk_layer_set_anchor.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self.lib.gtk_layer_set_exclusive_zone.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.gtk_layer_set_keyboard_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    def setup(self, win, layer, keyboard, exclusive=0):
+        ptr = ctypes.c_void_p(hash(win))
+        self.lib.gtk_layer_init_for_window(ptr)
+        self.lib.gtk_layer_set_layer(ptr, layer)
+        for e in (self.LEFT, self.RIGHT, self.EDGE_TOP, self.EDGE_BOTTOM):
+            self.lib.gtk_layer_set_anchor(ptr, e, 1)
+        self.lib.gtk_layer_set_exclusive_zone(ptr, exclusive)
+        self.lib.gtk_layer_set_keyboard_mode(ptr, keyboard)
+
+
+# ---------------- 应用与图标 ----------------
+def load_apps():
+    apps = []
+    for ai in Gio.AppInfo.get_all():
+        if not isinstance(ai, Gio.DesktopAppInfo):
+            continue
+        try:
+            if not ai.should_show():
+                continue
+            if not ai.get_display_name():
+                continue
+        except Exception:
+            continue
+        apps.append(ai)
+    apps.sort(key=lambda a: (a.get_display_name() or "").casefold())
+    return apps
+
+
+def category_of(ai):
+    try:
+        cats = set(x for x in (ai.get_categories() or "").split(";") if x)
+    except Exception:
+        cats = set()
+    for name, keys in CATEGORY_RULES:
+        if cats & keys:
+            return name
+    return "系统"
+
+
+def group_apps(apps):
+    buckets = {k: [] for k in CATEGORY_ORDER}
+    for ai in apps:
+        buckets[category_of(ai)].append(ai)
+    return [(k, buckets[k]) for k in CATEGORY_ORDER if buckets[k]]
+
+
+def load_recent():
+    """读取「常用」页的桌面文件 id 列表，最近的在前。"""
+    try:
+        with open(RECENT_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [str(x) for x in data]
+    except Exception:
+        pass
+    return []
+
+
+def save_recent(ids):
+    try:
+        d = os.path.dirname(RECENT_FILE)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        tmp = RECENT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(ids, f)
+        os.replace(tmp, RECENT_FILE)
+    except Exception as e:
+        log("save recent failed", repr(e))
+
+
+class IconCache:
+    def __init__(self):
+        self.theme = Gtk.IconTheme.get_default()
+        self.cache = {}
+
+    def for_app(self, ai, size):
+        key = (ai.get_id(), size)
+        if key in self.cache:
+            return self.cache[key]
+        pb = None
+        gicon = ai.get_icon()
+        if gicon is not None:
+            try:
+                info = self.theme.lookup_by_gicon(gicon, size, Gtk.IconLookupFlags.FORCE_SIZE)
+                if info:
+                    pb = info.load_icon()
+            except Exception:
+                pb = None
+        if pb is None:
+            pb = self.named("application-x-executable", size)
+        self.cache[key] = pb
+        return pb
+
+    def named(self, name, size):
+        key = (name, size)
+        if key in self.cache:
+            return self.cache[key]
+        pb = None
+        try:
+            info = self.theme.lookup_icon(name, size, Gtk.IconLookupFlags.FORCE_SIZE)
+            if info:
+                pb = info.load_icon()
+        except Exception:
+            pb = None
+        self.cache[key] = pb
+        return pb
+
+
+def cover_pixbuf(path, w, h):
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file(path)
+    except Exception as e:
+        log("wallpaper load failed:", path, e)
+        return None
+    if w <= 0 or h <= 0 or pb is None:
+        return None
+    pw, ph = pb.get_width(), pb.get_height()
+    s = max(w / pw, h / ph)
+    nw, nh = max(w, int(pw * s + 0.5)), max(h, int(ph * s + 0.5))
+    pb2 = pb.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR)
+    if pb2 is None:
+        return None
+    ox, oy = (nw - w) // 2, (nh - h) // 2
+    if nw > w or nh > h:
+        return pb2.new_subpixbuf(ox, oy, w, h)
+    return pb2
+
+
+def wallpaper_path():
+    # 优先用 ~/.config/android-home/wallpaper（里面只写一行图片路径），
+    # 没有就沿用 pcmanfm 的桌面配置，最后退回系统默认壁纸。
+    for candidate in (CUSTOM_WALLPAPER, PCMANFM_DESKTOP_CONF):
+        try:
+            if candidate == CUSTOM_WALLPAPER:
+                with open(candidate) as f:
+                    p = f.readline().strip().strip('"')
+            else:
+                p = ""
+                with open(candidate) as f:
+                    for line in f:
+                        if line.startswith("wallpaper="):
+                            p = line.split("=", 1)[1].strip().strip('"')
+                            break
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    return WALLPAPER_FALLBACK
+
+
+def draw_home_icon(size):
+    """画一个纯白色的“房子”图标：不依赖图标主题，白底壁纸上也清晰。"""
+    try:
+        import cairo
+    except Exception as e:
+        log("cairo unavailable", repr(e))
+        return None
+    s = float(size)
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    ctx = cairo.Context(surf)
+    ctx.set_source_rgba(1, 1, 1, 0.96)
+    # 屋顶 + 屋身（一笔画出的轮廓）
+    ctx.move_to(s * 0.50, s * 0.12)
+    ctx.line_to(s * 0.90, s * 0.47)
+    ctx.line_to(s * 0.78, s * 0.47)
+    ctx.line_to(s * 0.78, s * 0.86)
+    ctx.line_to(s * 0.22, s * 0.86)
+    ctx.line_to(s * 0.22, s * 0.47)
+    ctx.line_to(s * 0.10, s * 0.47)
+    ctx.close_path()
+    ctx.fill()
+    # 门镂空
+    ctx.set_operator(cairo.OPERATOR_CLEAR)
+    ctx.rectangle(s * 0.43, s * 0.64, s * 0.14, s * 0.22)
+    ctx.fill()
+    ctx.set_operator(cairo.OPERATOR_OVER)
+    return Gdk.pixbuf_get_from_surface(surf, 0, 0, size, size)
+
+
+def draw_gear_icon(size):
+    """画一个白色齿轮（设置）：不依赖图标主题。"""
+    try:
+        import cairo
+    except Exception as e:
+        log("cairo unavailable", repr(e))
+        return None
+    s = float(size)
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    ctx = cairo.Context(surf)
+    ctx.set_source_rgba(1, 1, 1, 0.96)
+    c = s / 2.0
+    for i in range(8):
+        ctx.save()
+        ctx.translate(c, c)
+        ctx.rotate(i * math.pi / 4)
+        ctx.rectangle(-s * 0.075, -s * 0.46, s * 0.15, s * 0.15)
+        ctx.fill()
+        ctx.restore()
+    ctx.arc(c, c, s * 0.34, 0, 2 * math.pi)
+    ctx.fill()
+    ctx.set_operator(cairo.OPERATOR_CLEAR)
+    ctx.arc(c, c, s * 0.14, 0, 2 * math.pi)
+    ctx.fill()
+    ctx.set_operator(cairo.OPERATOR_OVER)
+    return Gdk.pixbuf_get_from_surface(surf, 0, 0, size, size)
+
+
+def read_int_file(path, default, lo, hi):
+    try:
+        with open(path) as f:
+            v = int(f.readline().strip())
+        return max(lo, min(hi, v))
+    except Exception:
+        return default
+
+
+def write_text_file(path, text):
+    try:
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log("write failed", path, repr(e))
+        return False
+
+
+def load_font_px():
+    return read_int_file(FONT_FILE, FONT_DEFAULT, 8, 32)
+
+
+def load_idle_sec():
+    return read_int_file(IDLE_FILE, IDLE_DEFAULT, 0, 86400)
+
+
+def wallpaper_files():
+    out = []
+    try:
+        for name in sorted(os.listdir(WALLPAPER_DIR)):
+            if name.lower().endswith((".jpg", ".jpeg", ".png")):
+                out.append(os.path.join(WALLPAPER_DIR, name))
+    except Exception as e:
+        log("list wallpaper failed", repr(e))
+    return out
+
+
+def thumb_path(path):
+    h = hashlib.md5(path.encode()).hexdigest()[:12]
+    return os.path.join(THUMB_DIR, h + ".png")
+
+
+def make_thumb(path):
+    """生成/复用缩略图：46 张 4K 原图直接解码太慢，缓存成小 PNG。"""
+    tp = thumb_path(path)
+    if os.path.exists(tp):
+        return tp
+    pb = cover_pixbuf(path, THUMB_W, THUMB_H)
+    if pb is None:
+        return None
+    try:
+        os.makedirs(THUMB_DIR, exist_ok=True)
+        tmp = tp + ".tmp"
+        pb.savev(tmp, "png", [], [])
+        os.replace(tmp, tp)
+    except Exception as e:
+        log("thumb save failed", path, repr(e))
+        return None
+    return tp
+
+
+def ensure_display():
+    """手工/异常方式启动时补齐 DISPLAY，否则 X11 应用会报 Missing X server。"""
+    if os.environ.get("DISPLAY"):
+        return
+    try:
+        for name in sorted(os.listdir("/tmp/.X11-unix")):
+            if not name.startswith("X"):
+                continue
+            path = os.path.join("/tmp/.X11-unix", name)
+            if os.stat(path).st_uid != os.getuid():
+                continue
+            os.environ["DISPLAY"] = ":" + name[1:]
+            os.environ.setdefault(
+                "XAUTHORITY", os.path.join(os.path.expanduser("~"), ".Xauthority"))
+            log("display ->", os.environ["DISPLAY"])
+            return
+    except Exception as e:
+        log("display detect failed", e)
+
+
+# ---------------- 主屏 ----------------
+class Pager(Gtk.Fixed):
+    """分页容器。
+
+    子页面会按 (页号-当前页)*页宽 摆在两侧，绝对坐标很大；如果让 Gtk.Fixed
+    把这些算进自然尺寸，整个窗口会被撑到上万像素宽（dock 直接飞出屏幕）。
+    这里强制自然尺寸为 1，由父容器按窗口大小分配，超出部分交给窗口裁剪。
+    """
+
+    def do_get_preferred_width(self):
+        return 1, 1
+
+    def do_get_preferred_height(self):
+        return 1, 1
+
+
+class HomeScreen:
+    def __init__(self, ls):
+        self.ls = ls
+        self.apps = load_apps()
+        self.groups = group_apps(self.apps)
+        self.app_by_id = {ai.get_id(): ai for ai in self.apps}
+        self.icons = IconCache()
+        self.recent = load_recent()   # 「常用」页：最近启动在前
+        self.per_page = RECENT_FALLBACK
+        self.label_px = load_font_px()
+        self.dialog = None
+
+        self.page = 0
+        self.pages = 1
+        self._last_size = (0, 0)
+        self._rebuild_pending = False
+        self._last_launch = {}
+        self._toast_timer = None
+        self._press_x = None
+        self._press_y = None
+        self.hit_items = []          # 底部 dock 的命中区
+        self.page_hits = {}          # {页码: (分类名, [(控件, appinfo)])}
+
+        # 壁纸放独立窗口（background 层）：静态画面由合成器缓存，
+        # 翻页/拖动时只需要重绘图标层，不用每帧重新缩放整张壁纸。
+        self.wallwin = Gtk.Window()
+        self.wallwin.set_decorated(False)
+        self.wallwin.set_app_paintable(True)
+        self.wallwin.set_visual(Gdk.Screen.get_default().get_rgba_visual())
+        self.ls.setup(self.wallwin, self.ls.BACKGROUND, self.ls.KB_NONE)
+        self.bgimg = Gtk.Image()
+        self.wallwin.add(self.bgimg)
+        self._wall_size = (0, 0)
+        self.wallwin.connect("size-allocate", self._on_wall_alloc)
+
+        # 主屏本身是透明窗口，叠在壁纸窗口之上（bottom 层，仍低于普通窗口）
+        self.win = Gtk.Window()
+        self.win.set_decorated(False)
+        self.win.set_resizable(True)
+        self.win.set_app_paintable(True)
+        self.win.set_visual(Gdk.Screen.get_default().get_rgba_visual())
+        self.ls.setup(self.win, self.ls.BOTTOM, self.ls.KB_NONE)
+
+        self.root = Gtk.EventBox()
+        self.root.set_visible_window(True)   # 需要有窗口才能收到指针/触摸事件
+        self.root.set_name("ah-root")
+        self.win.add(self.root)
+
+        self.overlay = Gtk.Overlay()
+        self.root.add(self.overlay)
+
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.content.set_hexpand(True)
+        self.content.set_vexpand(True)
+        self.content.set_margin_top(12)
+        self.content.set_margin_bottom(6)
+        self.overlay.add_overlay(self.content)
+
+        self.catlabel = Gtk.Label(label="")
+        self.catlabel.set_halign(Gtk.Align.START)
+        self.catlabel.set_margin_start(30)
+        self.catlabel.set_margin_bottom(2)
+        self.catlabel.get_style_context().add_class("ah-cat")
+        self.content.pack_start(self.catlabel, False, False, 0)
+
+        # 分页容器：自己实现滑动，让页面实时跟手（Stack 只能整页动画，慢半拍）
+        self.pager = Pager()
+        self.pager.set_hexpand(True)
+        self.pager.set_vexpand(True)
+        self.content.pack_start(self.pager, True, True, 0)
+
+        # 拖动状态
+        self._shift = 0.0        # 当前页面横向偏移(像素)
+        self._page_w = 1         # 一页的宽度
+        self._dragging = False
+        self._anim_id = None
+        self._active_touches = 0
+        self._touch_cancel = False
+        self._mouse_down = False
+        self._layout_pending = False
+
+        self.dotsbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        self.dotsbox.set_halign(Gtk.Align.CENTER)
+        self.content.pack_start(self.dotsbox, False, False, 4)
+
+        self.dock = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=22)
+        self.dock.set_halign(Gtk.Align.CENTER)
+        self.content.pack_start(self.dock, False, False, 8)
+
+        # 点击后的即时反馈条
+        self.toast = Gtk.Label(label="")
+        self.toast.get_style_context().add_class("ah-toast")
+        self.toast.set_halign(Gtk.Align.CENTER)
+        self.toast.set_valign(Gtk.Align.END)
+        self.toast.set_margin_bottom(110)
+        self.toast.set_no_show_all(True)
+        self.overlay.add_overlay(self.toast)
+
+        self._apply_css()
+        self._load_wallpaper(1024, 740)
+
+        self.win.connect("size-allocate", self._on_alloc)
+
+        # 交互：Wayland 触摸不会产生 motion-notify，而且 Gesture 一旦 claim 序列
+        # 就会把其它处理器全部挡掉（GestureDrag 和 MultiPress 无法共存）。
+        # 所以直接处理 GDK 触摸事件；鼠标（VNC/远程）走 button/motion 事件。
+        self.root.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                             | Gdk.EventMask.BUTTON_RELEASE_MASK
+                             | Gdk.EventMask.POINTER_MOTION_MASK
+                             | Gdk.EventMask.TOUCH_MASK)
+        self.root.connect("touch-event", self._on_touch)
+        self.root.connect("button-press-event", self._on_button_press)
+        self.root.connect("button-release-event", self._on_button_release)
+        self.root.connect("motion-notify-event", self._on_motion)
+
+        self.build()
+
+    # ---- 样式 ----
+    def _apply_css(self):
+        css = Gtk.CssProvider()
+        data = """
+        #ah-root { background-color: transparent; }
+        .ah-cat { color: rgba(255,255,255,0.95); font-size: 17px; font-weight: bold;
+                  text-shadow: 0 1px 4px rgba(0,0,0,0.85); }
+        .ah-label { color: #ffffff; text-shadow: 0 1px 3px rgba(0,0,0,0.95); }
+        .ah-dot { color: rgba(255,255,255,0.45); font-size: 13px; text-shadow: 0 1px 2px rgba(0,0,0,0.8); }
+        .ah-dot-on { color: #ffffff; font-size: 13px; text-shadow: 0 1px 2px rgba(0,0,0,0.8); }
+        .ah-dock { background: rgba(0,0,0,0.28); border-radius: 24px; padding: 8px 18px; }
+        .ah-toast { background: rgba(0,0,0,0.68); color: #ffffff; border-radius: 18px;
+                    padding: 9px 22px; font-size: 14px; }
+        /* ---- 设置面板 ---- */
+        #ah-dim { background-color: rgba(0,0,0,0.55); }
+        #ah-panel { background-color: rgba(28,28,32,0.98); border-radius: 20px;
+                    border: 1px solid rgba(255,255,255,0.12); }
+        .ah-st-title { color: #ffffff; font-size: 24px; font-weight: bold; }
+        .ah-st-sec { color: rgba(255,255,255,0.72); font-size: 15px; }
+        .ah-st-btn { color: #ffffff; background-image: none; background-color: rgba(255,255,255,0.12);
+                     border: none; box-shadow: none; border-radius: 10px;
+                     padding: 9px 18px; font-size: 16px; }
+        .ah-st-btn:hover { background-color: rgba(255,255,255,0.22); }
+        .ah-st-sel { background-color: #3478f6; color: #ffffff; }
+        .ah-st-wp { background-image: none; background-color: transparent; border: none;
+                    box-shadow: none; padding: 4px; border-radius: 12px; }
+        .ah-st-wp-sel { background-color: rgba(52,120,246,0.28);
+                        border: 2px solid #3478f6; }
+        .ah-st-name { color: rgba(255,255,255,0.82); font-size: 12px; }
+        """
+        css.load_from_data(data.encode("utf-8"))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # 图标字体大小单独一个 provider，改字号时只需重新加载它
+        self._font_css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), self._font_css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        self._load_font_css()
+
+    def _load_font_css(self):
+        try:
+            self._font_css.load_from_data(
+                (".ah-label { font-size: %dpx; }" % self.label_px).encode())
+        except Exception as e:
+            log("font css failed", repr(e))
+
+    def _load_wallpaper(self, w, h):
+        if os.environ.get("AH_DEBUG_SOLID"):
+            pb = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, 8, 8)
+            pb.fill(0x00a040ff)
+            self.bgimg.set_from_pixbuf(pb)
+            self._wp_sig = None
+            return
+        p = wallpaper_path()
+        try:
+            self._wp_sig = (p, os.stat(p).st_mtime, w, h)
+        except Exception:
+            self._wp_sig = (p, 0, w, h)
+        pb = cover_pixbuf(p, w, h)
+        log("wallpaper:", p, pb is not None)
+        if pb is not None:
+            self.bgimg.set_from_pixbuf(pb)
+
+    def _on_wall_alloc(self, _w, alloc):
+        size = (alloc.width, alloc.height)
+        if size[0] <= 1 or size[1] <= 1 or size == self._wall_size:
+            return
+        self._wall_size = size
+        self.bgimg.set_hexpand(True)
+        self.bgimg.set_vexpand(True)
+        self._load_wallpaper(*size)
+
+    def _watch_wallpaper(self):
+        """壁纸文件被替换、~/.config/android-home/wallpaper 或字号改动时自动生效。"""
+        px = load_font_px()
+        if px != self.label_px:
+            log("font size ->", px)
+            self.label_px = px
+            self._load_font_css()
+            self._schedule_rebuild()
+
+        w, h = self._wall_size if self._wall_size[0] > 1 else self._last_size
+        if w <= 1:
+            return True
+        p = wallpaper_path()
+        try:
+            sig = (p, os.stat(p).st_mtime, w, h)
+        except Exception:
+            sig = (p, 0, w, h)
+        if sig != getattr(self, "_wp_sig", None):
+            log("wallpaper changed ->", p)
+            self._load_wallpaper(w, h)
+        return True
+
+    # ---- 布局 ----
+    def _on_alloc(self, widget, alloc):
+        size = (alloc.width, alloc.height)
+        if size == self._last_size or size[0] <= 1 or size[1] <= 1:
+            return
+        self._last_size = size
+        log("alloc", size)
+        self._schedule_rebuild()
+
+    def _schedule_rebuild(self):
+        if self._rebuild_pending:
+            return
+        self._rebuild_pending = True
+        GLib.idle_add(self._do_rebuild)
+
+    def _do_rebuild(self):
+        self._rebuild_pending = False
+        self.build()
+        return False
+
+    def _clear(self, box):
+        for ch in list(box.get_children()):
+            box.remove(ch)
+            ch.destroy()
+
+    def _recent_apps(self, per):
+        """按最近使用顺序取「常用」页的应用；已卸载的跳过，超出一页的丢弃最旧。"""
+        out = []
+        for aid in self.recent:
+            ai = self.app_by_id.get(aid)
+            if ai is not None and ai not in out:
+                out.append(ai)
+            if len(out) >= per:
+                break
+        return out
+
+    def _make_pages(self, per):
+        pages = []
+        fav = self._recent_apps(per)
+        if fav:
+            pages.append(("常用", fav))
+        for cat, items in self.groups:
+            for i in range(0, len(items), per):
+                pages.append((cat, items[i:i + per]))
+        return pages or [("应用", [])]
+
+    def build(self):
+        w, h = self._last_size
+        if w <= 1 or h <= 1:
+            w, h = 1024, 740
+        avail_h = h - 150
+        cols = max(3, min(6, w // 185))
+        rows = max(2, min(5, avail_h // 158))
+        per = cols * rows
+        self.per_page = per
+        # 启动记录只保留一页的量，多出来的（最旧的）直接丢掉
+        if len(self.recent) > per:
+            self.recent = self.recent[:per]
+            save_recent(self.recent)
+        pages = self._make_pages(per)
+        self.pages = len(pages)
+        if self.page >= self.pages:
+            self.page = self.pages - 1
+
+        self._build_pages(cols, rows, pages)
+        self._build_dots()
+        self._build_dock()
+        self.content.show_all()
+        self._apply_page(self.page, animate=False)
+        log("build %dx%d cols=%d rows=%d pages=%d page=%d apps=%d"
+            % (w, h, cols, rows, self.pages, self.page, len(self.apps)))
+
+    def _build_pages(self, cols, rows, pages):
+        self._stop_anim()
+        # 彻底销毁旧子项：只 remove 不 destroy 会在重建后留下同名隐藏实例，
+        # 命中测试就会指向那份不可见的副本(尺寸 1x1)，表现为点不动。
+        for ch in list(self.pager.get_children()):
+            self.pager.remove(ch)
+            ch.destroy()
+        self.page_hits = {}
+
+        w, h = self._last_size
+        if w <= 1:
+            w, h = 1024, 740
+        avail_h = max(100, h - 150)
+        self._page_w = w
+        self._shift = 0.0
+        cell_h = max(80, avail_h // rows)
+        cell_w = max(80, w // cols)
+        icon_sz = int(min(cell_w * 0.52, cell_h * 0.56, ICON_MAX))
+
+        for pno, (cat, chunk) in enumerate(pages):
+            grid = Gtk.Grid()
+            grid.set_row_homogeneous(True)
+            grid.set_column_homogeneous(True)
+            grid.set_size_request(w, cell_h * rows)
+            hits = []
+            for idx, ai in enumerate(chunk):
+                col, row = idx % cols, idx // cols
+                cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                cell.set_hexpand(True)
+                cell.set_vexpand(True)
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+                inner.set_halign(Gtk.Align.CENTER)
+                inner.set_valign(Gtk.Align.CENTER)
+                img = Gtk.Image()
+                img.set_halign(Gtk.Align.CENTER)
+                pb = self.icons.for_app(ai, icon_sz)
+                if pb is not None:
+                    img.set_from_pixbuf(pb)
+                lbl = Gtk.Label(label=ai.get_display_name())
+                lbl.set_ellipsize(Pango.EllipsizeMode.END)
+                lbl.set_max_width_chars(14)
+                lbl.set_justify(Gtk.Justification.CENTER)
+                lbl.set_halign(Gtk.Align.CENTER)
+                lbl.get_style_context().add_class("ah-label")
+                inner.pack_start(img, False, False, 0)
+                inner.pack_start(lbl, False, False, 0)
+                cell.pack_start(inner, True, True, 0)
+                grid.attach(cell, col, row, 1, 1)
+                hits.append((cell, ai))
+            # 所有页都放进 Fixed，按 (页号-当前页)*页宽 摆放，拖动时实时平移
+            self.pager.put(grid, (pno - self.page) * w, 0)
+            grid.show_all()
+            self.page_hits[pno] = (cat, hits, grid)
+        self._position_pages()
+
+    def _position_pages(self):
+        """全量摆放（重建/翻页结束时用一次）。"""
+        for pno, (_cat, _hits, grid) in self.page_hits.items():
+            x = (pno - self.page) * self._page_w + self._shift
+            self.pager.move(grid, int(round(x)), 0)
+
+    def _slide_pages(self):
+        """拖动过程中只移动当前页和左右相邻页，其余页留在原地。
+
+        触摸事件可达 60~120Hz，若每帧把 9 个页面都重排/重绘，CPU 会被打满，
+        画面就开始掉帧卡顿。
+        """
+        for pno in range(max(0, self.page - 1), min(self.pages, self.page + 2)):
+            entry = self.page_hits.get(pno)
+            if entry is None:
+                continue
+            x = (pno - self.page) * self._page_w + self._shift
+            self.pager.move(entry[2], int(round(x)), 0)
+
+    def _schedule_slide(self):
+        """把触摸位移合并到下一帧，并限制最高刷新率，避免 CPU 被重绘打满。"""
+        if self._layout_pending:
+            return
+        self._layout_pending = True
+        wait = MIN_FRAME_S - (time.monotonic() - getattr(self, "_last_slide", 0.0))
+        if wait <= 0.002:
+            GLib.idle_add(self._flush_slide)
+        else:
+            GLib.timeout_add(int(wait * 1000) + 1, self._flush_slide)
+
+    def _flush_slide(self):
+        self._layout_pending = False
+        self._last_slide = time.monotonic()
+        self._slide_pages()
+        return False
+
+    def _stop_anim(self):
+        if self._anim_id is not None:
+            GLib.source_remove(self._anim_id)
+            self._anim_id = None
+
+    def _animate_shift(self, target, done=None):
+        """把偏移量缓动到 target（松手后的翻页/回弹）。"""
+        self._stop_anim()
+        start = self._shift
+        dur = SLIDE_MS / 1000.0
+        t0 = time.monotonic()
+
+        def step():
+            t = min(1.0, (time.monotonic() - t0) / dur)
+            e = 1 - (1 - t) ** 3          # ease-out
+            self._shift = start + (target - start) * e
+            self._position_pages()
+            if t >= 1.0:
+                self._anim_id = None
+                self._shift = 0.0
+                if done:
+                    done()
+                self._position_pages()
+                return False
+            return True
+
+        self._anim_id = GLib.timeout_add(16, step)
+
+    def _apply_page(self, page, animate=True):
+        """切换到指定页；相邻页滑动动画，跨页直接切。"""
+        page = max(0, min(self.pages - 1, page))
+        if page not in self.page_hits:
+            return
+        if not animate or abs(page - self.page) != 1:
+            self._stop_anim()
+            self.page = page
+            self._shift = 0.0
+            self._update_page_ui()
+            self._position_pages()
+        else:
+            direction = -1 if page > self.page else 1
+            self._animate_shift(direction * self._page_w,
+                                lambda: self._finish_page(page))
+
+    def _finish_page(self, page):
+        self.page = page
+        self._update_page_ui()
+        self._position_pages()
+
+    def _update_page_ui(self):
+        cat = self.page_hits.get(self.page, ("",))[0]
+        self.catlabel.set_text(cat)
+        self._build_dots()
+        log("apply_page", self.page, cat)
+
+    def _build_dots(self):
+        self._clear(self.dotsbox)
+        if self.pages <= 1:
+            return
+        for i in range(self.pages):
+            l = Gtk.Label(label="●")
+            l.get_style_context().add_class("ah-dot-on" if i == self.page else "ah-dot")
+            self.dotsbox.add(l)
+            l.show()   # 翻页时重建的圆点必须显式 show，否则不显示
+
+    def _icon_cell(self, ai, size, pixbuf=None):
+        cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        cell.set_size_request(size + 22, size + 22)
+        img = Gtk.Image()
+        img.set_halign(Gtk.Align.CENTER)
+        img.set_valign(Gtk.Align.CENTER)
+        if pixbuf is not None:
+            pb = pixbuf
+        elif ai is not None:
+            pb = self.icons.for_app(ai, size)
+        else:
+            pb = self.icons.named("input-keyboard", size)
+        if pb is not None:
+            img.set_from_pixbuf(pb)
+        cell.pack_start(img, True, True, 0)
+        return cell
+
+    def _build_dock(self):
+        self._clear(self.dock)
+        self.hit_items = []
+        holder = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24)
+        holder.get_style_context().add_class("ah-dock")
+        # 第三个应用之后插入“回到常用页”按钮（视觉上位于 dock 正中）
+        before, after = DOCK_IDS[:3], DOCK_IDS[3:]
+        entries = []
+        for did in before:
+            ai = self._find_app(did)
+            if ai is not None:
+                entries.append((ai, None))
+        entries.append((None, "home"))
+        for did in after:
+            ai = self._find_app(did)
+            if ai is not None:
+                entries.append((ai, None))
+        entries.append((None, "osk"))
+        entries.append((None, "settings"))
+        for ai, kind in entries:
+            if kind == "home":
+                cell = self._icon_cell(None, DOCK_ICON, draw_home_icon(DOCK_ICON))
+            elif kind == "settings":
+                cell = self._icon_cell(None, DOCK_ICON, draw_gear_icon(DOCK_ICON))
+            else:
+                cell = self._icon_cell(ai, DOCK_ICON)
+            holder.add(cell)
+            self.hit_items.append((cell, kind if kind else ai))
+        self.dock.add(holder)
+        holder.show_all()
+
+    def _find_app(self, desktop_id):
+        for a in self.apps:
+            try:
+                if a.get_id() in (desktop_id, desktop_id + ".desktop"):
+                    return a
+            except Exception:
+                pass
+        return None
+
+    # ---- 交互 ----
+    def _show_toast(self, text):
+        self.toast.set_text(text)
+        self.toast.show()
+        if self._toast_timer is not None:
+            GLib.source_remove(self._toast_timer)
+        self._toast_timer = GLib.timeout_add(1800, self._hide_toast)
+
+    def _hide_toast(self):
+        self._toast_timer = None
+        self.toast.hide()
+        return False
+
+    # ---- 触摸/鼠标交互 ----
+    def _drag_start(self):
+        if not self._dragging:
+            self._dragging = True
+            self._stop_anim()
+            log("drag begin")
+
+    def _drag_to(self, dx, dy):
+        """返回 True 表示已进入拖动（页面跟手）。"""
+        if not self._dragging:
+            if abs(dx) < DRAG_START_PX or abs(dx) < abs(dy) * 1.2:
+                return False
+            self._drag_start()
+        shift = dx
+        if (self.page == 0 and shift > 0) or (self.page == self.pages - 1 and shift < 0):
+            shift *= 0.35              # 首/末页阻尼
+        self._shift = max(-self._page_w, min(self._page_w, shift))
+        self._schedule_slide()
+        return True
+
+    def _drag_end(self):
+        """松手：超过阈值或快速轻扫就翻页，否则回弹。"""
+        self._dragging = False
+        shift = self._shift
+        threshold = max(50, self._page_w * SNAP_RATIO)
+        elapsed = max(0.001, time.monotonic() - getattr(self, "_press_t", 0.0))
+        fling = abs(shift) >= 40 and abs(shift) / elapsed >= 500
+        # shift<0：页面被往左拖 -> 露出右边下一页；shift>0 -> 上一页
+        target = self.page + (1 if shift < 0 else -1)
+        target = max(0, min(self.pages - 1, target))
+        if (abs(shift) >= threshold or fling) and target != self.page:
+            log("page ->", target, "shift", int(shift), "fling", fling)
+            self._animate_shift(-self._page_w if shift < 0 else self._page_w,
+                                lambda: self._finish_page(target))
+        else:
+            log("page snap back", int(shift))
+            self._animate_shift(0.0)
+
+    def _tap_at(self, x, y):
+        obj = self._hit_test(x, y)
+        if obj == "osk":
+            log("tap osk")
+            self._on_osk_clicked(None)
+        elif obj == "home":
+            log("tap home -> page 0")
+            self._apply_page(0, animate=True)
+        elif obj == "settings":
+            log("tap settings")
+            self._open_settings()
+        elif obj is not None:
+            log("tap", x, y, "->", obj.get_id())
+            self._on_app_clicked(None, obj)
+        else:
+            log("tap", x, y, "-> no hit")
+
+    def _on_touch(self, _w, ev):
+        et = ev.type
+        if et == Gdk.EventType.TOUCH_BEGIN:
+            self._active_touches += 1
+            if self._active_touches > 1:
+                # 多指（三指切窗口/四指键盘）：取消翻页，避免和手势守护进程打架
+                self._touch_cancel = True
+                if self._dragging:
+                    self._dragging = False
+                    self._animate_shift(0.0)
+                return True
+            self._touch_cancel = False
+            self._press_x, self._press_y = ev.touch.x, ev.touch.y
+            self._press_t = time.monotonic()
+            self._dragging = False
+            log("touch begin")
+            return True
+
+        if et == Gdk.EventType.TOUCH_UPDATE:
+            if self._touch_cancel:
+                return True
+            dx = ev.touch.x - self._press_x
+            dy = ev.touch.y - self._press_y
+            self._drag_to(dx, dy)
+            return True
+
+        if et in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
+            self._active_touches = max(0, self._active_touches - 1)
+            if self._touch_cancel:
+                if self._active_touches == 0:
+                    self._touch_cancel = False
+                    self._dragging = False
+                    self._shift = 0.0
+                    self._position_pages()
+                return True
+            if self._dragging:
+                self._drag_end()
+            else:
+                self._tap_at(self._press_x, self._press_y)
+            return True
+        return False
+
+    # ---- 鼠标（VNC / 远程调试）----
+    def _on_button_press(self, _w, ev):
+        if self._active_touches > 0:
+            return False
+        self._mouse_down = True
+        self._press_x, self._press_y = ev.x, ev.y
+        self._press_t = time.monotonic()
+        self._dragging = False
+        return False
+
+    def _on_motion(self, _w, ev):
+        if not self._mouse_down or self._active_touches > 0:
+            return False
+        return self._drag_to(ev.x - self._press_x, ev.y - self._press_y)
+
+    def _on_button_release(self, _w, ev):
+        if not self._mouse_down:
+            return False
+        self._mouse_down = False
+        if self._dragging:
+            self._drag_end()
+        else:
+            self._tap_at(ev.x, ev.y)
+        return True
+
+    def _origin_in_root(self, widget):
+        """控件左上角在 root 坐标系里的位置。
+
+        注意不要自己逐级累加 allocation：GTK3 里 GtkBox 分配子控件时
+        allocation 已经带上了父级偏移(dock 里的图标会被重复计算父偏移，
+        结果落到屏幕外 y=1856)，只有 GtkStack 这类才是相对坐标。
+        一律交给 translate_coordinates 处理。
+        """
+        try:
+            res = widget.translate_coordinates(self.root, 0, 0)
+            # 不同 PyGObject 版本返回 (ok, x, y) 或 (x, y)
+            if isinstance(res, tuple) and len(res) == 3:
+                ok, tx, ty = res
+            else:
+                tx, ty = res
+                ok = True
+            if ok:
+                return int(tx), int(ty)
+        except Exception as e:
+            log("translate failed", repr(e))
+        # 兜底：取自身 allocation（Box 系子项在其中已是父窗口坐标系）
+        a = widget.get_allocation()
+        return a.x, a.y
+
+    def _hit_test(self, x, y):
+        # 先测当前页的图标，再测底部 dock
+        hits = list(self.page_hits.get(self.page, ("", []))[1]) + list(self.hit_items)
+        for widget, obj in hits:
+            alloc = widget.get_allocation()
+            ox, oy = self._origin_in_root(widget)
+            if ox <= x < ox + alloc.width and oy <= y < oy + alloc.height:
+                return obj
+        return None
+
+    def _on_app_clicked(self, _btn, ai):
+        aid = ai.get_id()
+        now = time.time()
+        # 防抖：同一个应用连点会重复拉起多个实例（实测被点出 13 次）
+        if now - self._last_launch.get(aid, 0.0) < LAUNCH_GAP:
+            return
+        self._last_launch[aid] = now
+        name = ai.get_display_name() or aid
+        self._show_toast("正在启动 %s…" % name)
+        try:
+            ai.launch([], None)
+            log("launch", aid)
+            self._remember(ai)
+        except Exception as e:
+            log("launch failed", aid, repr(e))
+            self._show_toast("启动失败：%s" % name)
+
+    def _remember(self, ai):
+        """把刚启动的应用放到「常用」页最前，只保留一页的量。"""
+        aid = ai.get_id()
+        self.recent = [x for x in self.recent if x != aid]
+        self.recent.insert(0, aid)
+        per = max(1, self.per_page)
+        del self.recent[per:]
+        save_recent(self.recent)
+        log("recent", ",".join(self.recent[:6]))
+        self._schedule_rebuild()
+
+    def _on_osk_clicked(self, _btn):
+        try:
+            subprocess.Popen(["/usr/local/bin/osk-toggle"])
+        except Exception as e:
+            log("osk-toggle failed", e)
+
+    def _open_settings(self):
+        if self.dialog is not None:
+            self.dialog.present()
+            return
+        self.dialog = SettingsDialog(self)
+
+    def run(self):
+        self.win.connect("destroy", Gtk.main_quit)
+        self.wallwin.show_all()
+        self.win.show_all()
+        log("shown %dx%d apps=%d pages=%d groups=%s"
+            % (self.win.get_allocated_width(), self.win.get_allocated_height(),
+               len(self.apps), self.pages,
+               ",".join("%s:%d" % (k, len(v)) for k, v in self.groups)))
+        GLib.timeout_add(6000, self._selfcheck)
+        GLib.timeout_add(WP_POLL_MS, self._watch_wallpaper)
+        Gtk.main()
+
+    def _selfcheck(self):
+        """布局完成后打印若干图标的实际命中区域，便于核对坐标是否正确。"""
+        def name_of(o):
+            return o if isinstance(o, str) else (o.get_id() if o is not None else None)
+
+        items = list(self.page_hits.get(self.page, ("", []))[1])[:2] + list(self.hit_items[-2:])
+        for w, obj in items:
+            a = w.get_allocation()
+            ox, oy = self._origin_in_root(w)
+            log("selfcheck", name_of(obj), "origin", (ox, oy), "size", (a.width, a.height))
+
+        # 命中链路自检：用每个 dock 图标的中心点跑一遍命中测试
+        for w, obj in self.hit_items:
+            a = w.get_allocation()
+            ox, oy = self._origin_in_root(w)
+            cx, cy = ox + a.width // 2, oy + a.height // 2
+            got = self._hit_test(cx, cy)
+            gname, expect = name_of(got), name_of(obj)
+            log("hit", "at", (cx, cy), "->", gname, "expect", expect,
+                "OK" if gname == expect else "MISMATCH")
+
+        for label, widget in (("page", self._first_widget(False)),
+                              ("dock", self._first_widget(True))):
+            if widget is None:
+                continue
+            chain, cur = [], widget
+            while cur is not None:
+                a = cur.get_allocation()
+                chain.append("%s(%d,%d %dx%d)" % (type(cur).__name__, a.x, a.y,
+                                                  a.width, a.height))
+                if cur is self.root:
+                    break
+                cur = cur.get_parent()
+            log("chain", label, " <- ".join(chain))
+        return False
+
+    def _first_widget(self, dock):
+        if dock:
+            return self.hit_items[0][0] if self.hit_items else None
+        items = self.page_hits.get(self.page, ("", []))[1]
+        return items[0][0] if items else None
+
+
+class SettingsDialog:
+    """设置面板：背景图片 / 熄屏时间 / 图标字体大小。
+
+    独立 OVERLAY 层窗口铺满整屏，点面板外的暗色区域关闭。
+    先显示面板再逐张加载缩略图，避免一次解码 40+ 张 4K 壁纸把界面卡住。
+    """
+
+    def __init__(self, home):
+        self.home = home
+        self._pending = []
+        self._wp_buttons = {}
+        self._idle_buttons = {}
+        self._font_buttons = []
+
+        self.win = Gtk.Window()
+        self.win.set_decorated(False)
+        self.win.set_app_paintable(True)
+        self.win.set_visual(Gdk.Screen.get_default().get_rgba_visual())
+        home.ls.setup(self.win, home.ls.OVERLAY, home.ls.KB_NONE)
+
+        dim = Gtk.EventBox()
+        dim.set_visible_window(True)
+        dim.set_name("ah-dim")
+        self.win.add(dim)
+        dim.connect("button-press-event", self._on_dim_press)
+
+        panel = Gtk.EventBox()
+        panel.set_visible_window(True)
+        panel.set_name("ah-panel")
+        panel.set_halign(Gtk.Align.CENTER)
+        panel.set_valign(Gtk.Align.CENTER)
+        panel.set_size_request(820, -1)
+        panel.connect("button-press-event", self._on_panel_press)   # 面板内点击不关闭
+        dim.add(panel)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(22)
+        panel.add(box)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        title = Gtk.Label(label="设置")
+        title.set_xalign(0)
+        title.get_style_context().add_class("ah-st-title")
+        head.pack_start(title, True, True, 0)
+        close = self._pill("关闭")
+        close.connect("button-press-event", lambda w, e: (self.close(), True)[1])
+        head.pack_end(close, False, False, 0)
+        box.pack_start(head, False, False, 0)
+
+        # ---- 背景图片 ----
+        box.pack_start(self._section("背景图片"), False, False, 0)
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_size_request(-1, 292)
+        sw.set_hexpand(True)
+        flow = Gtk.FlowBox()
+        flow.set_max_children_per_line(4)
+        flow.set_min_children_per_line(4)
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow.set_row_spacing(4)
+        flow.set_column_spacing(4)
+        flow.set_valign(Gtk.Align.START)
+        sw.add(flow)
+        box.pack_start(sw, False, False, 0)
+
+        cur = os.path.abspath(wallpaper_path())
+        for p in wallpaper_files():
+            # 用 EventBox 而不是 Gtk.Button：按钮会带主题的下边框，和深色面板不搭
+            tile = Gtk.EventBox()
+            tile.set_visible_window(True)
+            tile.get_style_context().add_class("ah-st-wp")
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            img = Gtk.Image()
+            img.set_size_request(THUMB_W, THUMB_H)
+            name = Gtk.Label(label=os.path.basename(p))
+            name.get_style_context().add_class("ah-st-name")
+            vb.pack_start(img, False, False, 0)
+            vb.pack_start(name, False, False, 0)
+            tile.add(vb)
+            tile.connect("button-press-event", self._on_wallpaper_tap, p)
+            flow.add(tile)
+            self._wp_buttons[p] = tile
+            self._pending.append((p, img))
+            if os.path.abspath(p) == cur:
+                tile.get_style_context().add_class("ah-st-wp-sel")
+        self._sel_wp = cur
+        self._sw = sw
+        GLib.idle_add(self._scroll_to_sel)
+
+        # ---- 熄屏时间 ----
+        box.pack_start(self._section("熄屏时间"), False, False, 4)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self._sel_idle = load_idle_sec()
+        for text, sec in IDLE_CHOICES:
+            b = self._pill(text)
+            b.connect("button-press-event", self._on_idle, sec)
+            row.pack_start(b, False, False, 0)
+            self._idle_buttons[sec] = b
+            if sec == self._sel_idle:
+                b.get_style_context().add_class("ah-st-sel")
+        box.pack_start(row, False, False, 0)
+
+        # ---- 图标字体 ----
+        box.pack_start(self._section("桌面图标字体大小"), False, False, 4)
+        row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self._sel_font = home.label_px
+        for text, px in FONT_CHOICES:
+            b = self._pill(text)
+            b.connect("button-press-event", self._on_font, px)
+            row2.pack_start(b, False, False, 0)
+            self._font_buttons.append((px, b))
+            if px == self._sel_font:
+                b.get_style_context().add_class("ah-st-sel")
+        box.pack_start(row2, False, False, 0)
+
+        self.win.connect("destroy", self._on_destroy)
+        self.win.show_all()
+        GLib.idle_add(self._load_next_thumb)
+
+    @staticmethod
+    def _section(text):
+        l = Gtk.Label(label=text)
+        l.set_xalign(0)
+        l.get_style_context().add_class("ah-st-sec")
+        return l
+
+    @staticmethod
+    def _pill(text):
+        """胶囊按钮：用 EventBox 承载，避免 GtkButton 的主题样式和事件吞掉问题。
+        EventBox 不适用 CSS padding，改用 label 的外边距撑出内边距。"""
+        eb = Gtk.EventBox()
+        eb.set_visible_window(True)
+        eb.get_style_context().add_class("ah-st-btn")
+        l = Gtk.Label(label=text)
+        l.set_margin_start(18)
+        l.set_margin_end(18)
+        l.set_margin_top(9)
+        l.set_margin_bottom(9)
+        eb.add(l)
+        return eb
+
+    def _load_next_thumb(self):
+        if not self._pending:
+            return False
+        p, img = self._pending.pop(0)
+        tp = make_thumb(p)
+        if tp:
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    tp, THUMB_W, THUMB_H, True)
+                img.set_from_pixbuf(pb)
+            except Exception as e:
+                log("thumb load failed", repr(e))
+        return True
+
+    def _on_dim_press(self, _w, ev):
+        if ev.button == 1:
+            self.close()
+            return True
+        return False
+
+    def _on_panel_press(self, _w, _ev):
+        return True      # 面板内点击不关闭面板
+
+    def _scroll_to_sel(self):
+        b = self._wp_buttons.get(self._sel_wp)
+        if b is None:
+            return False
+        y = b.get_allocation().y
+        h = b.get_allocation().height
+        adj = self._sw.get_vadjustment()
+        top = adj.get_upper() - adj.get_page_size()
+        # 让当前壁纸所在整行居中，避免只露出半行缩略图
+        adj.set_value(max(0.0, min(top, y + h / 2.0 - adj.get_page_size() / 2.0)))
+        return False
+
+    def _on_wallpaper_tap(self, _w, ev, path):
+        if ev.button != 1:
+            return False
+        log("wallpaper ->", path)
+        write_text_file(CUSTOM_WALLPAPER, path + "\n")
+        old = self._wp_buttons.get(self._sel_wp)
+        if old is not None:
+            old.get_style_context().remove_class("ah-st-wp-sel")
+        self._sel_wp = os.path.abspath(path)
+        self._wp_buttons[path].get_style_context().add_class("ah-st-wp-sel")
+        w, h = self.home._wall_size
+        if w <= 1:
+            w, h = self.home._last_size
+        if w > 1:
+            self.home._load_wallpaper(w, h)
+        self.home._show_toast("壁纸已切换")
+        return True
+
+    def _on_idle(self, _w, ev, sec):
+        if ev.button != 1:
+            return False
+        write_text_file(IDLE_FILE, "%d\n" % sec)
+        old = self._idle_buttons.get(self._sel_idle)
+        if old is not None:
+            old.get_style_context().remove_class("ah-st-sel")
+        self._sel_idle = sec
+        self._idle_buttons[sec].get_style_context().add_class("ah-st-sel")
+        # lwrespawn 守护的 ah-idle 会用新时长把 swayidle 重新拉起
+        try:
+            subprocess.Popen(["pkill", "-x", "swayidle"])
+        except Exception as e:
+            log("restart swayidle failed", repr(e))
+        return True
+
+    def _on_font(self, _w, ev, px):
+        if ev.button != 1:
+            return False
+        write_text_file(FONT_FILE, "%d\n" % px)
+        for old_px, b in self._font_buttons:
+            if old_px == self._sel_font:
+                b.get_style_context().remove_class("ah-st-sel")
+        self._sel_font = px
+        for p, b in self._font_buttons:
+            if p == px:
+                b.get_style_context().add_class("ah-st-sel")
+        self.home.label_px = px
+        self.home._load_font_css()
+        self.home._schedule_rebuild()
+        return True
+
+    def present(self):
+        self.win.present()
+
+    def close(self):
+        self.win.destroy()
+
+    def _on_destroy(self, _w):
+        self.home.dialog = None
+
+
+def main():
+    ensure_display()
+    ls = LayerShell()
+    HomeScreen(ls).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

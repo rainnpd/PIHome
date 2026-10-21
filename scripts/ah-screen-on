@@ -1,0 +1,20 @@
+#!/bin/sh
+# 开屏：
+# 1) 恢复外置 HUB 下游供电(触摸控制器重新枚举)；
+# 2) 打开 HDMI 输出(DPMS on)；
+# 3) DDC/CI 唤醒面板(DPM On)；
+# 4) 重建主屏进程：面板经 DDC 待机再唤醒后 GTK layer-shell 表面会失效，
+#    必须在视频输出恢复之后重启；重启期间屏上会有一段黑底，约 1.5 秒。
+#
+# 由 root 执行(swayidle 里 sudo -n)。环境变量含义同 ah-screen-off。
+U="${AH_USER:-${SUDO_USER:-rain}}"
+OUT="${AH_OUTPUT:-HDMI-A-1}"
+BUS="${AH_DDC_BUS:-13}"
+HUB="${AH_HUB:-3-2}"
+
+/usr/sbin/uhubctl -l "$HUB" -a on -f >/dev/null 2>&1
+runuser -u "$U" -- env WAYLAND_DISPLAY="wayland-0" XDG_RUNTIME_DIR="/run/user/$(id -u "$U")" \
+    /usr/bin/wlopm --on "$OUT" >/dev/null 2>&1
+/usr/bin/ddcutil --bus "$BUS" setvcp d6 01 >/dev/null 2>&1
+pkill -f '^python3 /usr/local/bin/android-home'
+sleep 2

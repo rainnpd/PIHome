@@ -1,0 +1,38 @@
+#!/bin/sh
+# 用户级 labwc autostart（会话以 labwc -m 运行 = merge 模式，
+# 系统级 /etc/xdg/labwc/autostart 也会执行，这里只补充主屏，
+# 不要重复 wf-panel-pi / kanshi / lxsession-xdg-autostart，
+# 否则这些程序会被启动两份)。
+
+# fcitx5 必须早于 squeekboard：先让 fcitx5 取得 zwp_input_method_v2，
+# 否则 squeekboard 会占住输入法角色，Wayland 原生应用(Trae/Chromium)
+# 只能收到生字母，五笔候选出不来。
+/usr/bin/fcitx5 -d
+
+/usr/bin/lwrespawn /usr/local/bin/kb-inset &
+
+# 主屏尽早启动：开机后的黑屏时长主要由这里决定。wf-panel 会稍后才映射，
+# 但主屏会监听窗口尺寸变化、在面板占位后自动重排，所以只需等面板进程出现。
+i=0
+while ! pgrep -x wf-panel-pi >/dev/null 2>&1 && [ $i -lt 40 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+sleep 0.3
+/usr/bin/lwrespawn /usr/local/bin/android-home &
+
+# 等 fcitx5 就绪后再起虚拟键盘，避免 squeekboard 抢走输入法角色
+i=0
+while ! pgrep -x fcitx5 >/dev/null 2>&1 && [ $i -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+sleep 1
+/usr/bin/lwrespawn /usr/bin/sbtest &
+
+# 熄屏：时长由桌面「设置」面板控制，写入 ~/.config/android-home/idle-timeout
+# （0 = 永不），ah-idle 读取该值启动 swayidle。这块屏的电流走 USB，
+# DPMS 只断信号不断电(背光常亮)，因此到点先关 HDMI 输出再切断外置 HUB 下游供电。
+# 键盘/鼠标不在该 HUB 上，任意按键/移动即可唤醒；
+# 注意：断电期间触摸控制器也断电，触摸无法唤醒，需用键盘或鼠标。
+/usr/bin/lwrespawn /usr/local/bin/ah-idle &

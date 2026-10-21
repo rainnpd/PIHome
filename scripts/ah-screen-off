@@ -1,0 +1,23 @@
+#!/bin/sh
+# 关屏：
+# 1) DDC/CI 把面板切到 DPM Off(背光真正熄灭、进入待机)，避免只断信号时
+#    屏幕停在「查找信号」界面继续耗电；
+# 2) 关 HDMI 输出(DPMS off)；
+# 3) 断外置 HUB 下游供电，触摸控制器断电省电。
+# 屏自带独立电源，Pi 侧无法切断其市电，DPM Off 是软件能达到的最低功耗状态。
+# 键盘/鼠标不在该 HUB 上，仍带电，可按键唤醒。
+#
+# 由 root 执行(swayidle 里 sudo -n)。以下参数可用环境变量覆盖：
+#   AH_USER   桌面会话用户(默认取 SUDO_USER，退回 rain)
+#   AH_OUTPUT HDMI 输出名(默认 HDMI-A-1)
+#   AH_DDC_BUS DDC 总线号(默认 13，可用 ddcutil detect 查看)
+#   AH_HUB    外置 HUB 的 uhubctl 位置(默认 3-2)
+U="${AH_USER:-${SUDO_USER:-rain}}"
+OUT="${AH_OUTPUT:-HDMI-A-1}"
+BUS="${AH_DDC_BUS:-13}"
+HUB="${AH_HUB:-3-2}"
+
+/usr/bin/ddcutil --bus "$BUS" setvcp d6 04 >/dev/null 2>&1
+runuser -u "$U" -- env WAYLAND_DISPLAY="wayland-0" XDG_RUNTIME_DIR="/run/user/$(id -u "$U")" \
+    /usr/bin/wlopm --off "$OUT" >/dev/null 2>&1
+exec /usr/sbin/uhubctl -l "$HUB" -a off -f >/dev/null 2>&1

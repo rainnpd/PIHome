@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""kb-inset — 虚拟键盘避让守护进程
+
+问题：squeekboard 占住屏幕下方约 1/3，盖住应用底部的输入框。
+思路：labwc 会把"最大化"的窗口自动让到键盘上方(exclusive zone)，
+      但浮动窗口不会。所以键盘弹出时把当前窗口最大化，收起时还原。
+
+实现：监听 sm.puri.OSK0 的 Visible 属性，用 wtype 触发 labwc 自己的
+      按键动作 C-A-Up(Maximize) / C-A-Down(UnMaximize)。
+      labwc 会吞掉这些按键，应用本身收不到，不会误触发。
+"""
+import subprocess
+import time
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+BUS, PATH, IFACE = "sm.puri.OSK0", "/sm/puri/OSK0", "sm.puri.OSK0"
+LOG = "/tmp/kb-inset.log"
+SETTLE_MS = 300          # 等合成器把键盘的独占区算进可用区域
+
+MAX_KEY = ["wtype", "-M", "ctrl", "-M", "alt", "-k", "Up", "-m", "alt", "-m", "ctrl"]
+UNMAX_KEY = ["wtype", "-M", "ctrl", "-M", "alt", "-k", "Down", "-m", "alt", "-m", "ctrl"]
+
+_pending = None
+_last = None
+_fail_logged = False
+
+
+def log(*a):
+    try:
+        with open(LOG, "a") as f:
+            f.write("[%s] %s\n" % (time.strftime("%H:%M:%S"),
+                                   " ".join(str(x) for x in a)))
+    except Exception:
+        pass
+
+
+def send(keyseq):
+    try:
+        subprocess.run(keyseq, timeout=3, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log("wtype failed: %r" % (e,))
+
+
+def apply(visible):
+    global _pending
+    _pending = None
+    log("apply visible=%s -> %s" % (visible, "Maximize" if visible else "UnMaximize"))
+    send(MAX_KEY if visible else UNMAX_KEY)
+    return False
+
+
+def schedule(visible):
+    global _pending
+    if _pending is not None:
+        GLib.source_remove(_pending)
+    _pending = GLib.timeout_add(SETTLE_MS, apply, visible)
+
+
+def read_visible():
+    """直接查一次 Visible。
+
+    不用 GDBusProxy 的 g-properties-changed：本机 squeekboard 启动较晚，
+    autostart 时服务名还不存在，代理建出来是"无 owner"状态，之后拿不到
+    属性变化通知，所以改成定时轮询，简单可靠。
+    """
+    global _fail_logged
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        res = bus.call_sync(
+            BUS, PATH, "org.freedesktop.DBus.Properties", "Get",
+            GLib.Variant("(ss)", (IFACE, "Visible")),
+            GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 1000, None)
+        _fail_logged = False
+        return bool(res.unpack()[0])
+    except Exception as e:
+        if not _fail_logged:
+            _fail_logged = True
+            log("read Visible failed: %r" % (e,))
+        return False
+
+
+def poll():
+    global _last
+    v = read_visible()
+    if v != _last:
+        log("Visible changed ->", v)
+        _last = v
+        schedule(v)
+    return True
+
+
+def main():
+    global _last
+    _last = read_visible()
+    log("started, visible=%s" % _last)
+    GLib.timeout_add(400, poll)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

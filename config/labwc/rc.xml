@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <theme>
+    <font place="ActiveWindow">
+      <name>Nunito Sans</name>
+      <size>21</size>
+      <weight>Light</weight>
+      <slant>Normal</slant>
+    </font>
+    <font place="InactiveWindow">
+      <name>Nunito Sans</name>
+      <size>21</size>
+      <weight>Light</weight>
+      <slant>Normal</slant>
+    </font>
+    <font place="OnScreenDisplay">
+      <name>Nunito Sans</name>
+      <size>21</size>
+      <weight>Light</weight>
+      <slant>Normal</slant>
+    </font>
+    <font place="MenuItem">
+      <name>Nunito Sans</name>
+      <size>21</size>
+      <weight>Light</weight>
+      <slant>Normal</slant>
+    </font>
+    <name>PiXtrix_l</name>
+  </theme>
+  <touch deviceName="wch.cn TouchScreen (USB 3-2.2)" mapToOutput="HDMI-A-1" mouseEmulation="yes"/>
+</openbox_config>

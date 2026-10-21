@@ -1,0 +1,8 @@
+*.bak
+*.bak-*
+*~
+__pycache__/
+*.pyc
+*.log
+thumbs/
+.DS_Store
