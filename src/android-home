@@ -36,6 +36,7 @@ PCMANFM_DESKTOP_CONF = os.path.expanduser(
 DOCK_IDS = ["chromium", "pcmanfm", "lxterminal", "galculator", "trae-cn"]
 
 DRAG_START_PX = 10     # 手指横向移动超过该值就开始“跟手”拖动
+LONG_PRESS_MS = 800    # 图标长按多久弹出「更多」菜单
 SNAP_RATIO = 0.12      # 松手时拖动超过页宽的该比例就翻页
 SLIDE_MS = 150         # 松手后的收尾动画时长(ms)
 MIN_FRAME_S = 0.022    # 拖动时的最高刷新间隔(~45fps)，给重绘留余量
@@ -424,6 +425,9 @@ class HomeScreen:
         self.per_page = RECENT_FALLBACK
         self.label_px = load_font_px()
         self.dialog = None
+        self.menu = None
+        self._long_timer = 0        # 长按计时器
+        self._long_fired = False    # 本次按压已弹出「更多」
 
         self.page = 0
         self.pages = 1
@@ -559,6 +563,15 @@ class HomeScreen:
         .ah-st-wp-sel { background-color: rgba(52,120,246,0.28);
                         border: 2px solid #3478f6; }
         .ah-st-name { color: rgba(255,255,255,0.82); font-size: 12px; }
+        /* ---- 更多菜单 / 应用信息 ---- */
+        #ah-catcher { background-color: rgba(0,0,0,0.10); }
+        #ah-menu { background-color: rgba(32,32,36,0.98); border-radius: 14px;
+                   border: 1px solid rgba(255,255,255,0.14); }
+        .ah-mi { color: #ffffff; background-image: none; background-color: transparent;
+                 border: none; box-shadow: none; border-radius: 9px; }
+        .ah-mi:hover { background-color: rgba(255,255,255,0.14); }
+        .ah-info-key { color: rgba(255,255,255,0.6); font-size: 13px; }
+        .ah-info-val { color: #ffffff; font-size: 15px; }
         """
         css.load_from_data(data.encode("utf-8"))
         Gtk.StyleContext.add_provider_for_screen(
@@ -994,6 +1007,7 @@ class HomeScreen:
             self._press_x, self._press_y = ev.touch.x, ev.touch.y
             self._press_t = time.monotonic()
             self._dragging = False
+            self._start_long_press(self._press_x, self._press_y)
             log("touch begin")
             return True
 
@@ -1002,10 +1016,12 @@ class HomeScreen:
                 return True
             dx = ev.touch.x - self._press_x
             dy = ev.touch.y - self._press_y
-            self._drag_to(dx, dy)
+            if self._drag_to(dx, dy):
+                self._cancel_long()     # 已经开始拖动，不再算长按
             return True
 
         if et in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
+            self._cancel_long()
             self._active_touches = max(0, self._active_touches - 1)
             if self._touch_cancel:
                 if self._active_touches == 0:
@@ -1014,6 +1030,12 @@ class HomeScreen:
                     self._shift = 0.0
                     self._position_pages()
                 return True
+            if self._long_fired:
+                self._long_fired = False
+                self._dragging = False
+                self._shift = 0.0
+                self._position_pages()
+                return True
             if self._dragging:
                 self._drag_end()
             else:
@@ -1021,25 +1043,91 @@ class HomeScreen:
             return True
         return False
 
+    # ---- 更多菜单 / 长按 ----
+    def _start_long_press(self, x, y):
+        self._cancel_long()
+        self._long_fired = False
+        self._long_timer = GLib.timeout_add(LONG_PRESS_MS, self._long_press_fired, x, y)
+
+    def _cancel_long(self):
+        if self._long_timer:
+            try:
+                GLib.source_remove(self._long_timer)
+            except Exception:
+                pass
+            self._long_timer = 0
+
+    def _long_press_fired(self, x, y):
+        self._long_timer = 0
+        if self._dragging or self._touch_cancel:
+            return False
+        obj = self._hit_test(x, y)
+        # 只有按在应用图标上才弹「更多」；空白处长按不做处理
+        if obj is not None and not isinstance(obj, str):
+            log("long press ->", obj.get_id())
+            self._long_fired = True
+            self._open_more_menu(obj, x, y)
+        return False
+
+    def _open_more_menu(self, app, x, y):
+        self._close_menu()
+        self.menu = MoreMenu(self, x, y, app)
+
+    def _open_desktop_menu(self, x, y):
+        self._close_menu()
+        self.menu = MoreMenu(self, x, y, None)
+
+    def _close_menu(self):
+        if self.menu is not None:
+            m, self.menu = self.menu, None
+            m.close()
+
+    def _open_app_info(self, app):
+        if self.dialog is not None:
+            return
+        self.dialog = InfoDialog(self, app)
+
     # ---- 鼠标（VNC / 远程调试）----
     def _on_button_press(self, _w, ev):
         if self._active_touches > 0:
+            return False
+        if ev.button == 3:
+            # 右键：图标上弹「打开 / 应用信息」，空白处弹「设置 / 更换壁纸」
+            obj = self._hit_test(ev.x, ev.y)
+            if obj is not None and not isinstance(obj, str):
+                self._open_more_menu(obj, ev.x, ev.y)
+            else:
+                self._open_desktop_menu(ev.x, ev.y)
+            return True
+        if ev.button != 1:
             return False
         self._mouse_down = True
         self._press_x, self._press_y = ev.x, ev.y
         self._press_t = time.monotonic()
         self._dragging = False
+        self._start_long_press(ev.x, ev.y)
         return False
 
     def _on_motion(self, _w, ev):
         if not self._mouse_down or self._active_touches > 0:
             return False
-        return self._drag_to(ev.x - self._press_x, ev.y - self._press_y)
+        if self._drag_to(ev.x - self._press_x, ev.y - self._press_y):
+            self._cancel_long()
+        return False
 
     def _on_button_release(self, _w, ev):
         if not self._mouse_down:
             return False
+        if ev.button != 1:
+            return False
+        self._cancel_long()
         self._mouse_down = False
+        if self._long_fired:
+            self._long_fired = False
+            self._dragging = False
+            self._shift = 0.0
+            self._position_pages()
+            return True
         if self._dragging:
             self._drag_end()
         else:
@@ -1403,6 +1491,179 @@ class SettingsDialog:
 
     def present(self):
         self.win.present()
+
+    def close(self):
+        self.win.destroy()
+
+    def _on_destroy(self, _w):
+        self.home.dialog = None
+
+
+class MoreMenu:
+    """右键 / 长按弹出的「更多」菜单。
+
+    独立 OVERLAY 窗口铺满整屏：暗色区域负责捕获外部点击并关闭，
+    菜单本体放在点击位置附近，超出屏幕时自动内收。
+    应用图标上显示「打开 / 应用信息」，空白处显示「设置 / 更换壁纸」。
+    """
+
+    WIDTH = 210
+
+    def __init__(self, home, x, y, app):
+        self.home = home
+        self.app = app
+        self.x, self.y = x, y
+
+        self.win = Gtk.Window()
+        self.win.set_decorated(False)
+        self.win.set_app_paintable(True)
+        self.win.set_visual(Gdk.Screen.get_default().get_rgba_visual())
+        home.ls.setup(self.win, home.ls.OVERLAY, home.ls.KB_NONE)
+
+        catcher = Gtk.EventBox()
+        catcher.set_visible_window(True)
+        catcher.set_name("ah-catcher")
+        catcher.connect("button-press-event", self._on_outside)
+        self.win.add(catcher)
+
+        self.fixed = Gtk.Fixed()
+        catcher.add(self.fixed)
+
+        panel = Gtk.EventBox()
+        panel.set_visible_window(True)
+        panel.set_name("ah-menu")
+        panel.set_size_request(self.WIDTH, -1)
+        panel.connect("button-press-event", lambda w, e: True)
+        panel.connect("size-allocate", self._place)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_border_width(6)
+        panel.add(box)
+        self.fixed.put(panel, int(x), int(y))
+        self.panel = panel
+
+        if app is not None:
+            items = [("打开", lambda: home._on_app_clicked(None, app)),
+                     ("应用信息", lambda: home._open_app_info(app))]
+        else:
+            items = [("设置", lambda: home._open_settings()),
+                     ("更换壁纸", lambda: home._open_settings())]
+        for text, cb in items:
+            box.pack_start(self._item(text, cb), False, False, 0)
+
+        self.win.show_all()
+
+    def _place(self, panel, alloc):
+        sw = max(1, self.home.root.get_allocated_width())
+        sh = max(1, self.home.root.get_allocated_height())
+        x = min(self.x, max(8, sw - alloc.width - 10))
+        y = min(self.y, max(8, sh - alloc.height - 10))
+        self.fixed.move(panel, int(x), int(y))
+
+    def _item(self, text, cb):
+        eb = Gtk.EventBox()
+        eb.set_visible_window(True)
+        eb.get_style_context().add_class("ah-mi")
+        l = Gtk.Label(label=text)
+        l.set_xalign(0)
+        l.set_margin_start(16)
+        l.set_margin_end(16)
+        l.set_margin_top(10)
+        l.set_margin_bottom(10)
+        eb.add(l)
+
+        def pressed(_w, ev):
+            if ev.button != 1:
+                return False
+            self.close()
+            # 延后执行，避免在新窗口创建时销毁当前菜单导致事件链断裂
+            GLib.idle_add(lambda: (cb(), False)[1])
+            return True
+        eb.connect("button-press-event", pressed)
+        return eb
+
+    def _on_outside(self, _w, ev):
+        if ev.button == 1:
+            self.close()
+            return True
+        return False
+
+    def close(self):
+        if self.home.menu is self:
+            self.home.menu = None
+        self.win.destroy()
+
+
+class InfoDialog:
+    """应用信息：名称、标识、命令、分类。"""
+
+    def __init__(self, home, app):
+        self.home = home
+        self.app = app
+
+        self.win = Gtk.Window()
+        self.win.set_decorated(False)
+        self.win.set_app_paintable(True)
+        self.win.set_visual(Gdk.Screen.get_default().get_rgba_visual())
+        home.ls.setup(self.win, home.ls.OVERLAY, home.ls.KB_NONE)
+
+        dim = Gtk.EventBox()
+        dim.set_visible_window(True)
+        dim.set_name("ah-dim")
+        dim.connect("button-press-event", self._on_dim_press)
+        self.win.add(dim)
+
+        panel = Gtk.EventBox()
+        panel.set_visible_window(True)
+        panel.set_name("ah-panel")
+        panel.set_halign(Gtk.Align.CENTER)
+        panel.set_valign(Gtk.Align.CENTER)
+        panel.set_size_request(560, -1)
+        panel.connect("button-press-event", lambda w, e: True)
+        dim.add(panel)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(22)
+        panel.add(box)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        title = Gtk.Label(label=app.get_display_name() or app.get_id())
+        title.set_xalign(0)
+        title.get_style_context().add_class("ah-st-title")
+        head.pack_start(title, True, True, 0)
+        close = SettingsDialog._pill("关闭")
+        close.connect("button-press-event", lambda w, e: (self.close(), True)[1])
+        head.pack_end(close, False, False, 0)
+        box.pack_start(head, False, False, 0)
+
+        cmd = ""
+        try:
+            cmd = app.get_commandline() or app.get_executable() or ""
+        except Exception:
+            cmd = app.get_executable() or ""
+        for key, val in (("应用标识", app.get_id()),
+                         ("启动命令", cmd),
+                         ("分类", category_of(app))):
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            k = Gtk.Label(label=key)
+            k.set_xalign(0)
+            k.get_style_context().add_class("ah-info-key")
+            v = Gtk.Label(label=val or "-")
+            v.set_xalign(0)
+            v.set_line_wrap(True)
+            v.set_selectable(True)
+            v.get_style_context().add_class("ah-info-val")
+            row.pack_start(k, False, False, 0)
+            row.pack_start(v, False, False, 0)
+            box.pack_start(row, False, False, 2)
+
+        self.win.connect("destroy", self._on_destroy)
+        self.win.show_all()
+
+    def _on_dim_press(self, _w, ev):
+        if ev.button == 1:
+            self.close()
+            return True
+        return False
 
     def close(self):
         self.win.destroy()
