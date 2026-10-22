@@ -114,19 +114,32 @@ class LayerShell:
 
 
 # ---------------- 应用与图标 ----------------
+# 会话环境里的 XDG_DATA_DIRS 含字面量 "~/.local/share"，GLib 不会展开 ~，
+# 所以这里自己按目录扫描，保证用户级安装的应用也能出现在桌面上。
+APP_DIRS = [os.path.expanduser("~/.local/share/applications"),
+            "/usr/local/share/applications",
+            "/usr/share/applications"]
+
+
 def load_apps():
     apps = []
-    for ai in Gio.AppInfo.get_all():
-        if not isinstance(ai, Gio.DesktopAppInfo):
-            continue
+    seen = set()
+    for d in APP_DIRS:
         try:
-            if not ai.should_show():
-                continue
-            if not ai.get_display_name():
-                continue
-        except Exception:
+            names = sorted(os.listdir(d))
+        except OSError:
             continue
-        apps.append(ai)
+        for fn in names:
+            if not fn.endswith(".desktop") or fn in seen:
+                continue
+            try:
+                ai = Gio.DesktopAppInfo.new_from_filename(os.path.join(d, fn))
+                if ai is None or not ai.get_display_name() or not ai.should_show():
+                    continue
+            except Exception:
+                continue
+            seen.add(fn)      # 同名文件按目录顺序取第一个（用户级优先）
+            apps.append(ai)
     apps.sort(key=lambda a: (a.get_display_name() or "").casefold())
     return apps
 
@@ -658,6 +671,16 @@ class HomeScreen:
         self._rebuild_pending = False
         self.build()
         return False
+
+    def refresh_apps(self):
+        """重新扫描已安装应用并重建页面（装/卸应用后无需重启进程）。"""
+        self.apps = load_apps()
+        self.groups = group_apps(self.apps)
+        self.app_by_id = {ai.get_id(): ai for ai in self.apps}
+        self.icons = IconCache()      # 新应用的图标要重新查主题
+        self.build()
+        log("refresh apps ->", len(self.apps), "pages", self.pages)
+        self._show_toast("应用列表已刷新")
 
     def _clear(self, box):
         for ch in list(box.get_children()):
@@ -1378,6 +1401,17 @@ class SettingsDialog:
                 b.get_style_context().add_class("ah-st-sel")
         box.pack_start(row2, False, False, 0)
 
+        # ---- 应用列表 ----
+        box.pack_start(self._section("应用"), False, False, 4)
+        row3 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        b = self._pill("刷新应用列表")
+        b.connect("button-press-event", self._on_refresh_apps)
+        row3.pack_start(b, False, False, 0)
+        hint = Gtk.Label(label="安装或卸载应用后点一次，无需重启桌面")
+        hint.get_style_context().add_class("ah-st-name")
+        row3.pack_start(hint, False, False, 0)
+        box.pack_start(row3, False, False, 0)
+
         self.win.connect("destroy", self._on_destroy)
         self.win.show_all()
         GLib.idle_add(self._load_next_thumb)
@@ -1489,6 +1523,17 @@ class SettingsDialog:
         self.home._schedule_rebuild()
         return True
 
+    def _on_refresh_apps(self, _w, ev):
+        if ev.button != 1:
+            return False
+        # 先关面板再刷新，刷新结果和提示才看得到
+        self.close()
+        GLib.idle_add(self._do_refresh)
+
+    def _do_refresh(self):
+        self.home.refresh_apps()
+        return False
+
     def present(self):
         self.win.present()
 
@@ -1504,7 +1549,7 @@ class MoreMenu:
 
     独立 OVERLAY 窗口铺满整屏：暗色区域负责捕获外部点击并关闭，
     菜单本体放在点击位置附近，超出屏幕时自动内收。
-    应用图标上显示「打开 / 应用信息」，空白处显示「设置 / 更换壁纸」。
+    应用图标上显示「打开 / 应用信息」，空白处显示「设置 / 更换壁纸 / 刷新应用列表」。
     """
 
     WIDTH = 210
@@ -1546,7 +1591,8 @@ class MoreMenu:
                      ("应用信息", lambda: home._open_app_info(app))]
         else:
             items = [("设置", lambda: home._open_settings()),
-                     ("更换壁纸", lambda: home._open_settings())]
+                     ("更换壁纸", lambda: home._open_settings()),
+                     ("刷新应用列表", lambda: home.refresh_apps())]
         for text, cb in items:
             box.pack_start(self._item(text, cb), False, False, 0)
 

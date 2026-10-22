@@ -33,9 +33,16 @@ _build_dots() / _build_dock()   底部圆点 + 常显 dock
    `lwrespawn` 拉起主屏进程（autostart 中会先等顶部面板出现），窗口建在 layer-shell 的 `BOTTOM` 层，全屏且位于普通窗口之下。
 
 2. **枚举应用**
-   `load_apps()` 遍历 `Gio.AppInfo.get_all()`，只保留 `DesktopAppInfo`；
-   用 `should_show()` 排除 `NoDisplay=true` / `Hidden=true`，以及没有显示名的条目；
-   最后按显示名排序。
+   `load_apps()` 直接扫描三个目录（顺序即优先级，同名文件取先出现的）：
+
+   ```
+   ~/.local/share/applications      用户级（优先级最高）
+   /usr/local/share/applications
+   /usr/share/applications
+   ```
+
+   逐个用 `Gio.DesktopAppInfo.new_from_filename()` 解析，再用 `should_show()` 排除 `NoDisplay=true` / `Hidden=true`，以及没有显示名的条目，最后按显示名排序。
+   之所以不用 `Gio.AppInfo.get_all()`：会话环境里的 `XDG_DATA_DIRS` 含有字面量 `~/.local/share`，GLib 不展开 `~`，会导致用户级安装的应用（如 Trae、Vita3K）不显示。
 
 3. **判定分类**
    `category_of()` 读取 `.desktop` 的 `Categories=`，与规则表求交集，
@@ -70,7 +77,7 @@ _build_dots() / _build_dock()   底部圆点 + 常显 dock
 
 8. **热更新范围**
    壁纸、字号、熄屏时长每 2 秒轮询配置文件，改动即时生效；
-   **应用列表只在进程启动时读取一次**，因此新装应用后必须重启主屏进程。
+   应用列表不会自动轮询，装/卸应用后点「刷新应用列表」即时重扫，无需重启进程。
 
 ## 二、新装应用如何确定分页
 
@@ -112,6 +119,12 @@ NoDisplay=false                     # 为 true 则桌面不显示
 
 ### 5. 让新应用立刻出现
 
+- 桌面空白处右键 →「刷新应用列表」
+- 或打开「设置」→「应用」→「刷新应用列表」
+
+刷新会重新扫描上面三个目录并重建分页，不需要重启桌面进程。
+只有在改动 `android-home` 代码本身时才需要：
+
 ```sh
 pkill -f '^python3 /usr/local/bin/android-home'   # lwrespawn 会自动拉起
 ```
@@ -135,9 +148,9 @@ PY
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| 装完不出现 | 应用列表只在启动时读取 | 重启主屏进程 |
+| 装完不出现 | 应用列表不会自动重扫 | 右键→「刷新应用列表」（或设置面板里的同名按钮） |
 | 图标空白 / 默认方块 | 图标主题缺 `Icon=` 指定的图标 | 改为主题中已有的图标名 |
-| 完全看不到 | `NoDisplay=true`、`Hidden=true` 或无 `Name` | 修改 desktop 文件 |
+| 完全看不到 | `NoDisplay=true`、`Hidden=true`、`Exec` 指向不存在的程序或缺 `Name` | 修改 desktop 文件 |
 | 分错页 | `Categories=` 命中了更靠前的规则 | 调整 `Categories=` 顺序/内容 |
 
 ## 四、相关代码位置
@@ -145,7 +158,8 @@ PY
 | 功能 | 代码位置 |
 | --- | --- |
 | 分类规则表 | `src/android-home` 中的 `CATEGORY_RULES` / `CATEGORY_ORDER` |
-| 应用枚举 | `load_apps()` |
+| 应用枚举 | `load_apps()`（扫描 `APP_DIRS`） |
+| 刷新应用列表 | `refresh_apps()`（右键菜单 / 设置面板） |
 | 分类判定 | `category_of()` |
 | 分类分组 | `group_apps()` |
 | 分页计算 | `_reflow()` / `_make_pages()` |
